@@ -1,46 +1,106 @@
 """
 BACKEND 1
-=================================
-Layer 4   : Legacy Packet Compiler
-            - Sentiment Analysis Classifier (EXIF / Clustering Worker)
-            - Archival Data Compression Pipeline
-            - Cryptographic Envelope Packager
-Layers 5-7: Compliance & Business Operations
-            - Statutory Jurisdictional Compliance Router
-            - Court-Ready Accounting PDF Builder
-            - Automated Billing & Micro-Transaction Execution Core
-            - Multi-Tenant RBAC Security Module
+===================================================
+Layer 1   : Account Federation / Asset Graph / Token Vault / Metadata Ingest
+Layer 2   : Vital Records / Consensus / Dead-Man's Switch / Audit Ledger
+Layer 3   : Financial Drain Sorter / Tier Router / State Machine / Execution
+Layer 4   : Legacy Packet Compiler (Sentiment / Compression / Crypto Envelope)
+Layers 5-7: Compliance Router / Court PDF / Billing / Multi-Tenant RBAC
 
+Language: Python 3.11+
 Deps    : cryptography (Fernet envelope encryption), fpdf2 (PDF generation),
           stdlib only otherwise (hashlib, gzip, json, statistics, dataclasses).
 
-All variable names are lowercase to separate it from the frontend. This module is fully
-executable end-to-end via the __main__ demo block at the bottom, which runs
-a synthetic estate through the entire Layer 4 -> Layers 5-7 pipeline and
-prints/serializes real, inspectable output (encrypted packet file + PDF).
+All variable names are lowercase to separate it from the frontend. 
 """
+
 from __future__ import annotations
- 
+
+import base64
 import gzip
 import hashlib
 import json
 import os
-import statistics
+import statistics  # noqa: F401 — retained from L4 spec
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from collections import defaultdict, deque
+from collections.abc import Generator
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
- 
+
 from cryptography.fernet import Fernet
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fpdf import FPDF
- 
- 
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
 # ======================================================================
-# SHARED / CORE DATA MODELS
+# PATHS & CONFIG
 # ======================================================================
- 
+
+_BASE_DIR = Path(__file__).resolve().parent
+_OUTPUT_DIR = _BASE_DIR / "output"
+_PACKET_DIR = _OUTPUT_DIR / "packets"
+_REPORT_DIR = _OUTPUT_DIR / "reports"
+
+
+class settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = f"sqlite:///{(_BASE_DIR / 'cognitive_probate.db').as_posix()}"
+    vault_master_key: str = "dev-only-change-me-32bytes-min!!"
+    cooling_off_days: int = 14
+    consensus_threshold: float = 2.0
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+
+
+@lru_cache
+def get_settings() -> settings:
+    return settings()
+
+
+__version__ = "1.0.0-merged-L1-L7"
+
+# ======================================================================
+# ENUMS — L1–L3 MERGE CONTRACT + L4–L7 EXTENSIONS
+# ======================================================================
+
+class assetcategory(str, Enum):
+    subscription = "subscription"
+    financial = "financial"
+    cloud_storage = "cloud_storage"
+    media = "media"
+    correspondence = "correspondence"
+
+
+class dispositionintent(str, Enum):
+    archive = "archive"
+    transfer = "transfer"
+    cancel = "cancel"
+    delete = "delete"
+
+
+class executionstate(str, Enum):
+    discovered = "discovered"
+    pending_approval = "pending_approval"
+    executing = "executing"
+    completed = "completed"
+
+
+class tierclassification(str, Enum):
+    api_native = "api_native"
+    browser_automation = "browser_automation"
+    manual_packet = "manual_packet"
+
+
 class assetdisposition(str, Enum):
     archive = "ARCHIVE"
     transfer = "TRANSFER_TO"
@@ -48,34 +108,272 @@ class assetdisposition(str, Enum):
     downgrade = "DOWNGRADE_TO_FREE"
     keep_active = "KEEP_ACTIVE"
     cancel = "CANCEL"
- 
- 
+
+
+class role(str, Enum):
+    decedent_owner = "DECEDENT_OWNER"
+    executor = "EXECUTOR"
+    beneficiary = "BENEFICIARY"
+    tenant_admin = "TENANT_ADMIN"
+    system_service = "SYSTEM_SERVICE"
+
+
+_DISPOSITIONINTENT_TO_ASSETDISPOSITION: dict[str, assetdisposition] = {
+    dispositionintent.archive.value: assetdisposition.archive,
+    dispositionintent.transfer.value: assetdisposition.transfer,
+    dispositionintent.cancel.value: assetdisposition.cancel,
+    dispositionintent.delete.value: assetdisposition.delete,
+}
+
+
+# ======================================================================
+# DATABASE — SQLALCHEMY (L1–L3 PERSISTENCE)
+# ======================================================================
+
+_settings = get_settings()
+_connect_args = (
+    {"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {}
+)
+engine = create_engine(_settings.database_url, connect_args=_connect_args)
+sessionlocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class base(DeclarativeBase):
+    pass
+
+
+class assetnode(base):
+    """Layer 1 — Digital Asset Graph node."""
+
+    __tablename__ = "layer1_assets"
+
+    assetid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    providername: Mapped[str] = mapped_column(String(128), nullable=False)
+    assetcategory: Mapped[str] = mapped_column(String(64), nullable=False)
+    dispositionintent: Mapped[str] = mapped_column(String(64), nullable=False)
+    beneficiaryid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    graphdependencies: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    financial_value_monthly: Mapped[float] = mapped_column(Float, default=0.0)
+    encrypted_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class tokenvaultentry(base):
+    """Layer 1 — OAuth / aggregator token vault."""
+
+    __tablename__ = "layer1_token_vault"
+
+    assetid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    providername: Mapped[str] = mapped_column(String(128), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class verificationrecord(base):
+    """Layer 2 — verification + cooling-off state (one per estate/case)."""
+
+    __tablename__ = "layer2_verification"
+
+    case_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    consensusscore: Mapped[float] = mapped_column(Float, default=0.0)
+    stateregistryhit: Mapped[bool] = mapped_column(Boolean, default=False)
+    attestationcount: Mapped[int] = mapped_column(Integer, default=0)
+    coolingoffstart: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    coolingoffend: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ledgerblockhash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    inactivity_days: Mapped[int] = mapped_column(Integer, default=0)
+    dead_man_armed: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class auditledgerentry(base):
+    """Layer 2 — cryptographic audit log."""
+
+    __tablename__ = "layer2_audit_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    ledgerblockhash: Mapped[str] = mapped_column(String(128), nullable=False)
+    prev_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class executionworkflow(base):
+    """Layer 3 — per-asset execution workflow."""
+
+    __tablename__ = "layer3_workflows"
+
+    workflowid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    assetid: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    idempotencykey: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    executionstate: Mapped[str] = mapped_column(String(64), nullable=False)
+    tierclassification: Mapped[str] = mapped_column(String(64), nullable=False)
+    financialdrainrank: Mapped[int] = mapped_column(Integer, nullable=False)
+    Humancheckpointtriggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    result_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = sessionlocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def init_db() -> None:
+    base.metadata.create_all(bind=engine)
+
+
+# ======================================================================
+# PYDANTIC SCHEMAS — L1–L3 HTTP CONTRACT
+# ======================================================================
+
+class assetenrollrequest(BaseModel):
+    assetid: str
+    providername: str
+    assetcategory: assetcategory
+    dispositionintent: dispositionintent
+    beneficiaryid: str | None = None
+    graphdependencies: list[str] = Field(default_factory=list)
+    financial_value_monthly: float = 0.0
+    metadata: dict = Field(default_factory=dict)
+    oauth_token: str | None = None
+
+
+class assetnodeout(BaseModel):
+    assetid: str
+    providername: str
+    assetcategory: str
+    dispositionintent: str
+    beneficiaryid: str | None
+    graphdependencies: list[str]
+    financial_value_monthly: float
+
+    model_config = {"from_attributes": True}
+
+
+class dependencyorderout(BaseModel):
+    ordered_assetids: list[str]
+
+
+class registryhitrequest(BaseModel):
+    case_id: str
+    deceased_name: str
+    death_certificate_id: str
+
+
+class attestationrequest(BaseModel):
+    case_id: str
+    contact_id: str
+
+
+class deadmanconfigrequest(BaseModel):
+    case_id: str
+    armed: bool = False
+    inactivity_days: int = 0
+
+
+class verificationout(BaseModel):
+    case_id: str
+    consensusscore: float
+    stateregistryhit: bool
+    attestationcount: int
+    coolingoffstart: datetime | None
+    coolingoffend: datetime | None
+    ledgerblockhash: str | None
+    ready_for_execution: bool
+
+    model_config = {"from_attributes": True}
+
+
+class startexecutionrequest(BaseModel):
+    case_id: str
+    force_skip_cooling_off: bool = False
+
+
+class approvecheckpointrequest(BaseModel):
+    workflowid: str
+    approved: bool = True
+
+
+class workflowout(BaseModel):
+    workflowid: str
+    assetid: str
+    case_id: str
+    idempotencykey: str
+    executionstate: executionstate | str
+    tierclassification: tierclassification | str
+    financialdrainrank: int
+    Humancheckpointtriggered: bool
+    result_note: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# ======================================================================
+# L4–L7 IN-MEMORY DATA MODELS
+# ======================================================================
+
 @dataclass
 class digitalasset:
-    """A single node in the user's Digital Asset Graph."""
+    """A single node in the user's Digital Asset Graph (L4+ runtime view)."""
     assetid: str
     userid: str
     provider: str
-    category: str                      # subscription | media | financial | correspondence
+    category: str
     disposition: assetdisposition
     monthlycost: float = 0.0
     sentimentaltag: bool = False
-    createdat: str = ""                # ISO timestamp, used for EXIF/clustering
+    createdat: str = ""
     gpslat: float | None = None
     gpslon: float | None = None
     rawbytesize: int = 0
-    content: bytes = b""               # simulated raw payload (photo/doc/message bytes)
- 
- 
+    content: bytes = b""
+    beneficiaryid: str | None = None
+    graphdependencies: list[str] = field(default_factory=list)
+
+
 @dataclass
 class fiduciarycontext:
     """Core identity + fiduciary-legal context threaded through every layer."""
     userid: str
     executorid: str
-    dpoahash: str                      # sha256 of the signed Digital Power of Appointment
-    fiduciaryjurisdiction: str          # e.g. "US-CA", "EU-DE", "IN"
-    fiduciarybondstatus: str            # "BONDED" | "UNBONDED" | "PENDING"
- 
+    dpoahash: str
+    fiduciaryjurisdiction: str
+    fiduciarybondstatus: str
+    case_id: str = ""
+
+
+@dataclass
+class tenant:
+    whitelabelid: str
+    tenantname: str
+    tenanttype: str
+
+
+@dataclass
+class principal:
+    principalid: str
+    principalrole: role
+    whitelabelid: str
+
+
+# ======================================================================
+# SHARED CRYPTO HELPERS (L1 VAULT + L4 ENVELOPE)
+# ======================================================================
+
+def _vault_fernet() -> Fernet:
+    key_material = get_settings().vault_master_key.encode("utf-8")
+    digest = hashlib.sha256(key_material).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+""" Layers 1-3 to be added here """
  
 # ======================================================================
 # LAYER 4.1 — SENTIMENT ANALYSIS CLASSIFIER (EXIF / CLUSTERING WORKER)
