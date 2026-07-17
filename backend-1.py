@@ -389,7 +389,131 @@ class courtreadyaccountingpdfbuilder:
         indexpdfhash = hashlib.sha256(pdf_bytes).hexdigest()
  
         return {"pdfpath": out_path, "indexpdfhash": indexpdfhash}
- 
- 
+
+
+# ======================================================================
+# LAYER 7A — AUTOMATED BILLING & MICRO-TRANSACTION EXECUTION CORE
+# ======================================================================
+
+class circuitbreakertripped(Exception):
+    pass
+
+
+class automatedbillingcore:
+    def __init__(self, fee_rate: float = 0.015, anomaly_threshold: float = 0.40):
+        self.fee_rate = fee_rate
+        self.anomaly_threshold = anomaly_threshold
+        self.subscribestatus = "ACTIVE"
+        self.circuitbreakerstatus = "CLOSED"
+        self._last_valuation: float | None = None
+
+    def compute_valuation(self, assets: list[digitalasset]) -> float:
+        assetvaluation = sum(a.monthlycost * 12 for a in assets if a.disposition != assetdisposition.delete)
+        return round(assetvaluation, 2)
+
+    def _check_circuit_breaker(self, new_valuation: float) -> None:
+        if self._last_valuation is not None and self._last_valuation > 0:
+            delta = abs(new_valuation - self._last_valuation) / self._last_valuation
+            if delta > self.anomaly_threshold:
+                self.circuitbreakerstatus = "OPEN"
+                raise circuitbreakertripped(
+                    f"valuation delta {delta:.2%} exceeds anomaly threshold "
+                    f"{self.anomaly_threshold:.2%} — billing halted for manual review"
+                )
+        self._last_valuation = new_valuation
+
+    def execute_billing(self, ctx: fiduciarycontext, assets: list[digitalasset]) -> dict[str, Any]:
+        if self.subscribestatus != "ACTIVE":
+            raise circuitbreakertripped(
+                f"userid {ctx.userid} subscribestatus={self.subscribestatus} — cannot bill"
+            )
+
+        assetvaluation = self.compute_valuation(assets)
+        self._check_circuit_breaker(assetvaluation)
+
+        executionfeecalculated = round(assetvaluation * self.fee_rate, 2)
+        monthly_drain_eliminated = round(
+            sum(
+                a.monthlycost
+                for a in assets
+                if a.disposition in (assetdisposition.cancel, assetdisposition.delete)
+            ),
+            2,
+        )
+
+        transactionid = str(uuid.uuid4())
+        return {
+            "transactionid": transactionid,
+            "userid": ctx.userid,
+            "executorid": ctx.executorid,
+            "assetvaluation": assetvaluation,
+            "executionfeecalculated": executionfeecalculated,
+            "feerate": self.fee_rate,
+            "monthlydraineliminated": monthly_drain_eliminated,
+            "billedagainst": "ESTATE_ACCOUNT",
+            "status": "SETTLED",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "subscribestatus": self.subscribestatus,
+            "circuitbreakerstatus": self.circuitbreakerstatus,
+        }
+
+
+# ======================================================================
+# LAYER 7B — MULTI-TENANT RBAC SECURITY MODULE
+# ======================================================================
+
+class accessdeniederror(Exception):
+    pass
+
+
+_permission_matrix: dict[role, set[str]] = {
+    role.decedent_owner: {"read_graph", "write_graph", "sign_dpoa"},
+    role.executor: {"read_graph", "approve_action", "trigger_billing", "download_packet", "download_pdf"},
+    role.beneficiary: {"read_own_transfers"},
+    role.tenant_admin: {"read_graph", "read_billing", "manage_tenant_users"},
+    role.system_service: {"read_graph", "write_graph", "execute_action", "trigger_billing", "write_audit_log"},
+}
+
+
+class multitenantrbacsecuritymodule:
+    def __init__(self):
+        self._audit_log: list[dict[str, Any]] = []
+
+    def authorize(self, actor: principal, action: str, resource_whitelabelid: str) -> bool:
+        entry = {
+            "eventid": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "principalid": actor.principalid,
+            "role": actor.principalrole.value,
+            "action": action,
+            "resourcewhitelabelid": resource_whitelabelid,
+            "actorwhitelabelid": actor.whitelabelid,
+        }
+
+        if actor.whitelabelid != resource_whitelabelid:
+            entry["result"] = "DENIED_TENANT_ISOLATION"
+            self._audit_log.append(entry)
+            raise accessdeniederror(
+                f"principal {actor.principalid} (tenant={actor.whitelabelid}) "
+                f"denied cross-tenant access to resource tenant={resource_whitelabelid}"
+            )
+
+        allowed_actions = _permission_matrix.get(actor.principalrole, set())
+        if action not in allowed_actions:
+            entry["result"] = "DENIED_ROLE_PERMISSION"
+            self._audit_log.append(entry)
+            raise accessdeniederror(
+                f"principal {actor.principalid} with role {actor.principalrole.value} "
+                f"lacks permission for action '{action}'"
+            )
+
+        entry["result"] = "GRANTED"
+        self._audit_log.append(entry)
+        return True
+
+    def get_audit_log(self) -> list[dict[str, Any]]:
+        return self._audit_log
+
+
  
  
