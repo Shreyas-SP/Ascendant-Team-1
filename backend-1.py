@@ -232,5 +232,164 @@ class cryptographicenvelopepackager:
             ciphertext = f.read()
         fernet = Fernet(envelopekey.encode("utf-8"))
         return fernet.decrypt(ciphertext)
+
+# ======================================================================
+# LAYER 5 — STATUTORY JURISDICTIONAL COMPLIANCE ROUTER
+# ======================================================================
+ 
+class jurisdictioncomplianceerror(Exception):
+    pass
+ 
+ 
+class statutoryjurisdictioncompliancerouter:
+    """
+    Routes an estate's execution plan through the correct legal ruleset
+    based on fiduciaryjurisdiction. Blocks execution if bond status or
+    jurisdictional prerequisites are not satisfied.
+    """
+ 
+    _ruleset_table: dict[str, dict[str, Any]] = {
+        "US": {
+            "statute": "RUFADAA",
+            "requires_bond": True,
+            "cooling_off_days": 21,
+            "death_registry": "SSA_DMF / STATE_VITAL_RECORDS",
+        },
+        "EU": {
+            "statute": "GDPR_ART17_ERASURE_BY_PROXY",
+            "requires_bond": True,
+            "cooling_off_days": 30,
+            "death_registry": "NATIONAL_CIVIL_REGISTRY",
+        },
+        "IN": {
+            "statute": "DPDP_ACT_2023_NOMINEE_RIGHTS",
+            "requires_bond": True,
+            "cooling_off_days": 30,
+            "death_registry": "CRS_INDIA",
+        },
+        "UK": {
+            "statute": "DIGITAL_ECONOMY_ACT",
+            "requires_bond": True,
+            "cooling_off_days": 21,
+            "death_registry": "GRO_UK",
+        },
+    }
+ 
+    def route(self, ctx: fiduciarycontext) -> dict[str, Any]:
+        region = ctx.fiduciaryjurisdiction.split("-")[0].upper()
+        ruleset = self._ruleset_table.get(region)
+        if ruleset is None:
+            raise jurisdictioncomplianceerror(
+                f"no compliance ruleset registered for jurisdiction '{ctx.fiduciaryjurisdiction}'"
+            )
+        if ruleset["requires_bond"] and ctx.fiduciarybondstatus != "BONDED":
+            raise jurisdictioncomplianceerror(
+                f"executor {ctx.executorid} is not bonded "
+                f"(status={ctx.fiduciarybondstatus}) — execution blocked under {ruleset['statute']}"
+            )
+        return {
+            "jurisdiction": ctx.fiduciaryjurisdiction,
+            "applicablestatute": ruleset["statute"],
+            "coolingoffdays": ruleset["cooling_off_days"],
+            "deathregistrysource": ruleset["death_registry"],
+            "compliancecleared": True,
+        }
+ 
+ 
+# ======================================================================
+# LAYER 6 — COURT-READY ACCOUNTING PDF BUILDER
+# ======================================================================
+ 
+class courtreadyaccountingpdfbuilder:
+    """
+    Generates a probate-court-admissible accounting document: itemized
+    asset disposition, valuations, fees, and compliance attestation.
+    Produces indexpdfhash (sha256 of the rendered PDF bytes) for the
+    immutable audit log.
+    """
+ 
+    def __init__(self, output_dir: str = "/home/claude/reports"):
+        os.makedirs(output_dir, exist_ok=True)
+        self.output_dir = output_dir
+ 
+    def build(
+        self,
+        ctx: fiduciarycontext,
+        assets: list[digitalasset],
+        compliance: dict[str, Any],
+        billing: dict[str, Any],
+        packet_meta: dict[str, str],
+    ) -> dict[str, str]:
+        pdf = FPDF(format="A4")
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Cognitive Probate - Court-Ready Digital Estate Accounting", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"Generated: {datetime.now(timezone.utc).isoformat()}Z", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+ 
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "I. Fiduciary Identification", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for label, value in [
+            ("User ID (Decedent)", ctx.userid),
+            ("Executor ID", ctx.executorid),
+            ("DPoA Hash", ctx.dpoahash),
+            ("Jurisdiction", ctx.fiduciaryjurisdiction),
+            ("Bond Status", ctx.fiduciarybondstatus),
+            ("Applicable Statute", compliance["applicablestatute"]),
+            ("Cooling-Off Period (days)", str(compliance["coolingoffdays"])),
+        ]:
+            pdf.cell(0, 6, f"{label}: {value}", new_x="LMARGIN", new_y="NEXT")
+ 
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "II. Digital Asset Disposition Ledger", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(45, 6, "Asset ID", border=1)
+        pdf.cell(35, 6, "Provider", border=1)
+        pdf.cell(35, 6, "Category", border=1)
+        pdf.cell(35, 6, "Disposition", border=1)
+        pdf.cell(30, 6, "Monthly Cost", border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        for a in assets:
+            pdf.cell(45, 6, a.assetid[:18], border=1)
+            pdf.cell(35, 6, a.provider, border=1)
+            pdf.cell(35, 6, a.category, border=1)
+            pdf.cell(35, 6, a.disposition.value, border=1)
+            pdf.cell(30, 6, f"${a.monthlycost:,.2f}", border=1, new_x="LMARGIN", new_y="NEXT")
+ 
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "III. Valuation & Fee Accounting", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for label, value in [
+            ("Total Estate Asset Valuation", f"${billing['assetvaluation']:,.2f}"),
+            ("Execution Fee (calculated)", f"${billing['executionfeecalculated']:,.2f}"),
+            ("Effective Fee Rate", f"{billing['feerate'] * 100:.2f}%"),
+            ("Recurring Financial Drain Eliminated / mo", f"${billing['monthlydraineliminated']:,.2f}"),
+            ("Billing Circuit Breaker Status", billing["circuitbreakerstatus"]),
+        ]:
+            pdf.cell(0, 6, f"{label}: {value}", new_x="LMARGIN", new_y="NEXT")
+ 
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "IV. Legacy Packet Attestation", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"Packet Output URL: {packet_meta['packetoutputurl']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, f"Ciphertext Size (bytes): {packet_meta['ciphertextsize']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, "Envelope Key: [ESCROWED TO EXECUTOR - NOT PRINTED]", new_x="LMARGIN", new_y="NEXT")
+ 
+        filename = f"court_accounting_{ctx.userid}_{uuid.uuid4()}.pdf"
+        out_path = os.path.join(self.output_dir, filename)
+        pdf.output(out_path)
+ 
+        with open(out_path, "rb") as f:
+            pdf_bytes = f.read()
+        indexpdfhash = hashlib.sha256(pdf_bytes).hexdigest()
+ 
+        return {"pdfpath": out_path, "indexpdfhash": indexpdfhash}
+ 
+ 
  
  
