@@ -1,5 +1,5 @@
 """
-BACKEND 1
+BACKEND
 ===================================================
 Layer 1   : Account Federation / Asset Graph / Token Vault / Metadata Ingest
 Layer 2   : Vital Records / Consensus / Dead-Man's Switch / Audit Ledger
@@ -373,7 +373,582 @@ def _vault_fernet() -> Fernet:
     digest = hashlib.sha256(key_material).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
 
-""" Layers 1-3 to be added here """
+
+# ======================================================================
+# LAYER 1 — ENROLLMENT / GRAPH / VAULT / METADATA
+# ======================================================================
+
+def encrypt_metadata(metadata: dict) -> str:
+    payload = json.dumps(metadata, sort_keys=True).encode("utf-8")
+    return _vault_fernet().encrypt(payload).decode("utf-8")
+
+
+def decrypt_metadata(ciphertext: str) -> dict:
+    raw = _vault_fernet().decrypt(ciphertext.encode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
+
+
+def store_token(db: Session, assetid: str, providername: str, oauth_token: str) -> tokenvaultentry:
+    ciphertext = _vault_fernet().encrypt(oauth_token.encode("utf-8")).decode("utf-8")
+    entry = db.get(tokenvaultentry, assetid)
+    if entry is None:
+        entry = tokenvaultentry(assetid=assetid, providername=providername, ciphertext=ciphertext)
+        db.add(entry)
+    else:
+        entry.providername = providername
+        entry.ciphertext = ciphertext
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def reveal_token(db: Session, assetid: str) -> str | None:
+    entry = db.get(tokenvaultentry, assetid)
+    if entry is None:
+        return None
+    return _vault_fernet().decrypt(entry.ciphertext.encode("utf-8")).decode("utf-8")
+
+
+def enroll_asset(db: Session, req: assetenrollrequest) -> assetnodeout:
+    if req.dispositionintent == dispositionintent.transfer and not req.beneficiaryid:
+        raise HTTPException(status_code=400, detail="beneficiaryid required when dispositionintent=transfer")
+
+    existing = db.get(assetnode, req.assetid)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"assetid already exists: {req.assetid}")
+
+    node = assetnode(
+        assetid=req.assetid,
+        providername=req.providername.lower(),
+        assetcategory=req.assetcategory.value,
+        dispositionintent=req.dispositionintent.value,
+        beneficiaryid=req.beneficiaryid,
+        graphdependencies=list(req.graphdependencies),
+        financial_value_monthly=req.financial_value_monthly,
+        encrypted_metadata=encrypt_metadata(req.metadata) if req.metadata else None,
+    )
+    db.add(node)
+
+    if req.oauth_token:
+        store_token(db, req.assetid, req.providername.lower(), req.oauth_token)
+
+    db.commit()
+    db.refresh(node)
+    return assetnodeout.model_validate(node)
+
+
+def list_assets(db: Session) -> list[assetnodeout]:
+    rows = db.query(assetnode).all()
+    return [assetnodeout.model_validate(r) for r in rows]
+
+
+def get_asset(db: Session, assetid: str) -> assetnodeout:
+    node = db.get(assetnode, assetid)
+    if not node:
+        raise HTTPException(status_code=404, detail="assetid not found")
+    return assetnodeout.model_validate(node)
+
+
+def resolve_execution_order(db: Session, assetids: list[str] | None = None) -> list[str]:
+    q = db.query(assetnode)
+    if assetids:
+        q = q.filter(assetnode.assetid.in_(assetids))
+    nodes = q.all()
+    ids = {n.assetid for n in nodes}
+    graph: dict[str, list[str]] = defaultdict(list)
+    indegree: dict[str, int] = {i: 0 for i in ids}
+
+    for node in nodes:
+        for dep in node.graphdependencies or []:
+            if dep not in ids:
+                continue
+            graph[dep].append(node.assetid)
+            indegree[node.assetid] += 1
+
+    queue = deque([i for i, d in indegree.items() if d == 0])
+    ordered: list[str] = []
+    while queue:
+        cur = queue.popleft()
+        ordered.append(cur)
+        for nxt in graph[cur]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                queue.append(nxt)
+
+    if len(ordered) != len(ids):
+        raise HTTPException(status_code=400, detail="Cycle detected in graphdependencies")
+    return ordered
+
+
+# ======================================================================
+# LAYER 2 — VITAL RECORDS / CONSENSUS / DEAD-MAN / AUDIT LEDGER
+# ======================================================================
+
+def _hash_block(prev_hash: str | None, event_type: str, payload: dict, created_at: datetime) -> str:
+    material = {
+        "prev_hash": prev_hash or "GENESIS",
+        "event_type": event_type,
+        "payload": payload,
+        "created_at": created_at.isoformat(),
+    }
+    raw = json.dumps(material, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def append_ledger(db: Session, case_id: str, event_type: str, payload: dict) -> str:
+    last = (
+        db.query(auditledgerentry)
+        .filter(auditledgerentry.case_id == case_id)
+        .order_by(auditledgerentry.id.desc())
+        .first()
+    )
+    prev_hash = last.ledgerblockhash if last else None
+    created_at = datetime.utcnow()
+    ledgerblockhash = _hash_block(prev_hash, event_type, payload, created_at)
+    entry = auditledgerentry(
+        case_id=case_id,
+        event_type=event_type,
+        payload_json=json.dumps(payload, sort_keys=True),
+        ledgerblockhash=ledgerblockhash,
+        prev_hash=prev_hash,
+        created_at=created_at,
+    )
+    db.add(entry)
+    db.commit()
+    return ledgerblockhash
+
+
+def query_state_registry(deceased_name: str, death_certificate_id: str) -> bool:
+    _ = deceased_name
+    return bool(death_certificate_id) and death_certificate_id.upper().startswith("DC-")
+
+
+def ensure_case(db: Session, case_id: str) -> verificationrecord:
+    row = db.get(verificationrecord, case_id)
+    if row is None:
+        row = verificationrecord(case_id=case_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def configure_dead_man(db: Session, case_id: str, armed: bool, inactivity_days: int) -> verificationrecord:
+    row = ensure_case(db, case_id)
+    row.dead_man_armed = armed
+    row.inactivity_days = inactivity_days
+    db.commit()
+    db.refresh(row)
+    append_ledger(
+        db,
+        case_id,
+        "DEAD_MAN_CONFIG",
+        {"armed": armed, "inactivity_days": inactivity_days},
+    )
+    return row
+
+
+def evaluate_inactivity(db: Session, case_id: str, threshold_days: int = 365) -> bool:
+    row = ensure_case(db, case_id)
+    if not row.dead_man_armed:
+        return False
+    if threshold_days <= 0:
+        raise HTTPException(status_code=400, detail="threshold_days must be > 0")
+    triggered = row.inactivity_days >= threshold_days
+    if triggered:
+        append_ledger(
+            db,
+            case_id,
+            "DEAD_MAN_TRIGGERED",
+            {"inactivity_days": row.inactivity_days, "threshold_days": threshold_days},
+        )
+    return triggered
+
+
+def _verification_to_out(row: verificationrecord) -> verificationout:
+    cfg = get_settings()
+    ready = (
+        row.consensusscore >= cfg.consensus_threshold
+        and row.stateregistryhit
+        and row.attestationcount >= 1
+        and row.coolingoffend is not None
+        and datetime.utcnow() >= row.coolingoffend
+    )
+    return verificationout(
+        case_id=row.case_id,
+        consensusscore=row.consensusscore,
+        stateregistryhit=row.stateregistryhit,
+        attestationcount=row.attestationcount,
+        coolingoffstart=row.coolingoffstart,
+        coolingoffend=row.coolingoffend,
+        ledgerblockhash=row.ledgerblockhash,
+        ready_for_execution=ready,
+    )
+
+
+def _recompute_consensus(db: Session, row: verificationrecord) -> verificationrecord:
+    cfg = get_settings()
+    dead_man = 0.5 if evaluate_inactivity(db, row.case_id) else 0.0
+    row.consensusscore = (
+        (1.0 if row.stateregistryhit else 0.0) + float(row.attestationcount) + dead_man
+    )
+
+    if (
+        row.consensusscore >= cfg.consensus_threshold
+        and row.stateregistryhit
+        and row.attestationcount >= 1
+        and row.coolingoffstart is None
+    ):
+        row.coolingoffstart = datetime.utcnow()
+        row.coolingoffend = row.coolingoffstart + timedelta(days=cfg.cooling_off_days)
+        row.ledgerblockhash = append_ledger(
+            db,
+            row.case_id,
+            "COOLING_OFF_STARTED",
+            {
+                "consensusscore": row.consensusscore,
+                "coolingoffstart": row.coolingoffstart.isoformat(),
+                "coolingoffend": row.coolingoffend.isoformat(),
+            },
+        )
+    else:
+        row.ledgerblockhash = append_ledger(
+            db,
+            row.case_id,
+            "CONSENSUS_UPDATED",
+            {
+                "consensusscore": row.consensusscore,
+                "stateregistryhit": row.stateregistryhit,
+                "attestationcount": row.attestationcount,
+            },
+        )
+
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def record_registry_hit(
+    db: Session, case_id: str, deceased_name: str, death_certificate_id: str
+) -> verificationout:
+    hit = query_state_registry(deceased_name, death_certificate_id)
+    row = ensure_case(db, case_id)
+    row.stateregistryhit = hit
+    db.commit()
+    row = _recompute_consensus(db, row)
+    return _verification_to_out(row)
+
+
+def record_attestation(db: Session, case_id: str, contact_id: str) -> verificationout:
+    row = ensure_case(db, case_id)
+    row.attestationcount += 1
+    db.commit()
+    append_ledger(db, case_id, "ATTESTATION", {"contact_id": contact_id})
+    row = _recompute_consensus(db, row)
+    return _verification_to_out(row)
+
+
+def get_verification(db: Session, case_id: str) -> verificationout:
+    row = ensure_case(db, case_id)
+    return _verification_to_out(row)
+
+
+def assert_ready_for_execution(
+    db: Session, case_id: str, force_skip_cooling_off: bool = False
+) -> verificationrecord:
+    row = ensure_case(db, case_id)
+    cfg = get_settings()
+    if row.consensusscore < cfg.consensus_threshold:
+        raise HTTPException(status_code=409, detail="consensusscore below threshold")
+    if not row.stateregistryhit or row.attestationcount < 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Need at least two independent confirmations (stateregistryhit + attestation)",
+        )
+    if not force_skip_cooling_off:
+        if row.coolingoffend is None:
+            raise HTTPException(status_code=409, detail="cooling-off not started")
+        if datetime.utcnow() < row.coolingoffend:
+            raise HTTPException(
+                status_code=409,
+                detail=f"cooling-off active until {row.coolingoffend.isoformat()}",
+            )
+    return row
+
+
+# ======================================================================
+# LAYER 3 — TIER ROUTING / DRAIN SORT / STATE MACHINE / EXECUTION
+# ======================================================================
+
+API_NATIVE_PROVIDERS = {"google", "microsoft", "dropbox", "apple"}
+BROWSER_AUTOMATION_PROVIDERS = {"netflix", "spotify", "hulu", "gym", "planetfitness"}
+CHECKPOINT_MONTHLY_THRESHOLD = 50.0
+
+ALLOWED_TRANSITIONS: dict[executionstate, set[executionstate]] = {
+    executionstate.discovered: {executionstate.pending_approval, executionstate.executing},
+    executionstate.pending_approval: {executionstate.executing},
+    executionstate.executing: {executionstate.completed},
+    executionstate.completed: set(),
+}
+
+
+def classify_tier(providername: str) -> tierclassification:
+    p = providername.lower()
+    if p in API_NATIVE_PROVIDERS:
+        return tierclassification.api_native
+    if p in BROWSER_AUTOMATION_PROVIDERS:
+        return tierclassification.browser_automation
+    return tierclassification.manual_packet
+
+
+def rank_assets_by_financial_drain(db: Session, ordered_assetids: list[str]) -> list[tuple[str, int]]:
+    nodes = {
+        n.assetid: n
+        for n in db.query(assetnode).filter(assetnode.assetid.in_(ordered_assetids)).all()
+    }
+    dep_index = {aid: i for i, aid in enumerate(ordered_assetids)}
+
+    def sort_key(assetid: str) -> tuple:
+        node = nodes[assetid]
+        intent = node.dispositionintent
+        cancel_band = 0 if intent in (
+            dispositionintent.cancel.value,
+            dispositionintent.delete.value,
+        ) else 1
+        return (cancel_band, -float(node.financial_value_monthly or 0.0), dep_index[assetid])
+
+    sorted_ids = sorted(ordered_assetids, key=sort_key)
+    return [(aid, rank + 1) for rank, aid in enumerate(sorted_ids)]
+
+
+def can_transition(current: str | executionstate, nxt: executionstate) -> bool:
+    cur = executionstate(current) if isinstance(current, str) else current
+    return nxt in ALLOWED_TRANSITIONS[cur]
+
+
+def next_after_discover(Humancheckpointtriggered: bool) -> executionstate:
+    if Humancheckpointtriggered:
+        return executionstate.pending_approval
+    return executionstate.executing
+
+
+def run_browser_cancellation(providername: str, assetid: str) -> dict:
+    return {
+        "status": "REQUIRES_HUMAN_REVIEW",
+        "providername": providername,
+        "assetid": assetid,
+        "sandbox": "playwright_isolation_stub",
+        "note": "Install playwright browsers in prod; submission gated on Humancheckpointtriggered approval.",
+    }
+
+
+def _needs_checkpoint(node: assetnode, tier: tierclassification) -> bool:
+    if tier != tierclassification.api_native:
+        return True
+    if (node.financial_value_monthly or 0) >= CHECKPOINT_MONTHLY_THRESHOLD:
+        return True
+    if node.dispositionintent == dispositionintent.transfer.value:
+        return True
+    return False
+
+
+def _execute_action(db: Session, node: assetnode, tier: tierclassification) -> str:
+    token_present = reveal_token(db, node.assetid) is not None
+    if tier == tierclassification.api_native:
+        return (
+            f"API_NATIVE:{node.dispositionintent} on {node.providername} "
+            f"(token={'yes' if token_present else 'no'})"
+        )
+    if tier == tierclassification.browser_automation:
+        packet = run_browser_cancellation(node.providername, node.assetid)
+        return f"BROWSER_AUTOMATION:{packet['status']}"
+    return (
+        f"MANUAL_PACKET: prefilled cancellation/export for {node.providername} "
+        f"intent={node.dispositionintent} beneficiaryid={node.beneficiaryid}"
+    )
+
+
+def start_case_execution(
+    db: Session, case_id: str, force_skip_cooling_off: bool = False
+) -> list[workflowout]:
+    assert_ready_for_execution(db, case_id, force_skip_cooling_off=force_skip_cooling_off)
+
+    ordered = resolve_execution_order(db)
+    if not ordered:
+        raise HTTPException(status_code=400, detail="No Layer 1 assets enrolled")
+
+    ranked = rank_assets_by_financial_drain(db, ordered)
+    workflows: list[workflowout] = []
+
+    for assetid, financialdrainrank in ranked:
+        node = db.get(assetnode, assetid)
+        assert node is not None
+        tier = classify_tier(node.providername)
+        Humancheckpointtriggered = _needs_checkpoint(node, tier)
+        idempotencykey = f"{case_id}:{assetid}:v1"
+
+        existing = db.query(executionworkflow).filter_by(idempotencykey=idempotencykey).first()
+        if existing:
+            workflows.append(workflowout.model_validate(existing))
+            continue
+
+        workflowid = f"wf_{uuid.uuid4().hex[:12]}"
+        state = next_after_discover(Humancheckpointtriggered)
+        wf = executionworkflow(
+            workflowid=workflowid,
+            assetid=assetid,
+            case_id=case_id,
+            idempotencykey=idempotencykey,
+            executionstate=executionstate.discovered.value,
+            tierclassification=tier.value,
+            financialdrainrank=financialdrainrank,
+            Humancheckpointtriggered=Humancheckpointtriggered,
+        )
+        db.add(wf)
+        db.commit()
+        db.refresh(wf)
+
+        if can_transition(wf.executionstate, state):
+            wf.executionstate = state.value
+            wf.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(wf)
+
+        append_ledger(
+            db,
+            case_id,
+            "WORKFLOW_CREATED",
+            {
+                "workflowid": workflowid,
+                "assetid": assetid,
+                "financialdrainrank": financialdrainrank,
+                "tierclassification": tier.value,
+                "Humancheckpointtriggered": Humancheckpointtriggered,
+                "executionstate": wf.executionstate,
+            },
+        )
+        workflows.append(workflowout.model_validate(wf))
+
+    append_ledger(db, case_id, "EXECUTION_BATCH_STARTED", {"workflow_count": len(workflows)})
+    return workflows
+
+
+def approve_checkpoint(db: Session, workflowid: str, approved: bool = True) -> workflowout:
+    wf = db.get(executionworkflow, workflowid)
+    if not wf:
+        raise HTTPException(status_code=404, detail="workflowid not found")
+    if wf.executionstate != executionstate.pending_approval.value:
+        raise HTTPException(status_code=409, detail="workflow not awaiting approval")
+    if not approved:
+        wf.result_note = "Rejected at human checkpoint"
+        db.commit()
+        return workflowout.model_validate(wf)
+    if not can_transition(wf.executionstate, executionstate.executing):
+        raise HTTPException(status_code=409, detail="invalid state transition")
+    wf.executionstate = executionstate.executing.value
+    wf.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(wf)
+    append_ledger(
+        db,
+        wf.case_id,
+        "CHECKPOINT_APPROVED",
+        {"workflowid": workflowid, "assetid": wf.assetid},
+    )
+    return workflowout.model_validate(wf)
+
+
+def advance_executing(db: Session, workflowid: str) -> workflowout:
+    wf = db.get(executionworkflow, workflowid)
+    if not wf:
+        raise HTTPException(status_code=404, detail="workflowid not found")
+    if wf.executionstate != executionstate.executing.value:
+        raise HTTPException(status_code=409, detail="workflow not in executing state")
+
+    node = db.get(assetnode, wf.assetid)
+    if not node:
+        raise HTTPException(status_code=404, detail="assetid missing")
+
+    note = _execute_action(db, node, tierclassification(wf.tierclassification))
+    if not can_transition(wf.executionstate, executionstate.completed):
+        raise HTTPException(status_code=409, detail="invalid state transition")
+    wf.executionstate = executionstate.completed.value
+    wf.result_note = note
+    wf.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(wf)
+    append_ledger(
+        db,
+        wf.case_id,
+        "WORKFLOW_COMPLETED",
+        {
+            "workflowid": workflowid,
+            "assetid": wf.assetid,
+            "tierclassification": wf.tierclassification,
+            "result_note": note,
+        },
+    )
+    return workflowout.model_validate(wf)
+
+
+def list_workflows(db: Session, case_id: str | None = None) -> list[workflowout]:
+    q = db.query(executionworkflow)
+    if case_id:
+        q = q.filter(executionworkflow.case_id == case_id)
+    rows = q.order_by(executionworkflow.financialdrainrank.asc()).all()
+    return [workflowout.model_validate(r) for r in rows]
+
+
+def run_all_workflows_to_completion(db: Session, case_id: str) -> list[workflowout]:
+    """Advance every workflow through checkpoints to completed state."""
+    completed: list[workflowout] = []
+    for wf in list_workflows(db, case_id):
+        if wf.executionstate == executionstate.pending_approval.value:
+            wf = approve_checkpoint(db, wf.workflowid, approved=True)
+        if wf.executionstate == executionstate.executing.value:
+            wf = advance_executing(db, wf.workflowid)
+        completed.append(wf)
+    return completed
+
+
+# ======================================================================
+# L1 → L4 BRIDGE — UNIFY ASSET REPRESENTATIONS
+# ======================================================================
+
+def layer1_node_to_digitalasset(node: assetnode, userid: str) -> digitalasset:
+    meta: dict[str, Any] = {}
+    if node.encrypted_metadata:
+        try:
+            meta = decrypt_metadata(node.encrypted_metadata)
+        except Exception:
+            meta = {}
+
+    disposition = _DISPOSITIONINTENT_TO_ASSETDISPOSITION.get(
+        node.dispositionintent,
+        assetdisposition.keep_active,
+    )
+
+    return digitalasset(
+        assetid=node.assetid,
+        userid=userid,
+        provider=node.providername,
+        category=node.assetcategory,
+        disposition=disposition,
+        monthlycost=float(node.financial_value_monthly or 0.0),
+        sentimentaltag=bool(meta.get("sentimentaltag", False)),
+        createdat=str(meta.get("createdat", node.created_at.isoformat() if node.created_at else "")),
+        gpslat=meta.get("gpslat"),
+        gpslon=meta.get("gpslon"),
+        rawbytesize=int(meta.get("rawbytesize", 0)),
+        content=bytes(meta.get("content_stub", b"")) if meta.get("content_stub") else os.urandom(256) if meta.get("simulate_content") else b"",
+        beneficiaryid=node.beneficiaryid,
+        graphdependencies=list(node.graphdependencies or []),
+    )
+
+
+def layer1_graph_to_digitalassets(db: Session, userid: str) -> list[digitalasset]:
+    nodes = db.query(assetnode).all()
+    return [layer1_node_to_digitalasset(n, userid) for n in nodes]
  
 # ======================================================================
 # LAYER 4.1 — SENTIMENT ANALYSIS CLASSIFIER (EXIF / CLUSTERING WORKER)
