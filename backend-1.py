@@ -515,5 +515,433 @@ class multitenantrbacsecuritymodule:
         return self._audit_log
 
 
- 
+ # ======================================================================
+# LAYER 4–7 ORCHESTRATOR (POST L3 EXECUTION)
+# ======================================================================
+
+class cognitiveprobateorchestrator:
+    def __init__(self, whitelabelid: str = "TENANT_DIRECT_001"):
+        self.whitelabelid = whitelabelid
+        self.rbac = multitenantrbacsecuritymodule()
+        self.compliance_router = statutoryjurisdictioncompliancerouter()
+        self.billing_core = automatedbillingcore()
+        self.pdf_builder = courtreadyaccountingpdfbuilder()
+        self.packager = cryptographicenvelopepackager()
+        self.cluster_worker = sentimentclusterworker()
+
+    def run(
+        self,
+        ctx: fiduciarycontext,
+        assets: list[digitalasset],
+        layer2_ledgerblockhash: str | None = None,
+        layer3_workflows: list[workflowout] | None = None,
+    ) -> dict[str, Any]:
+        system_actor = principal(
+            principalid="orchestrator_svc",
+            principalrole=role.system_service,
+            whitelabelid=self.whitelabelid,
+        )
+        executor_actor = principal(
+            principalid=ctx.executorid,
+            principalrole=role.executor,
+            whitelabelid=self.whitelabelid,
+        )
+
+        self.rbac.authorize(system_actor, "read_graph", self.whitelabelid)
+        self.rbac.authorize(executor_actor, "approve_action", self.whitelabelid)
+
+        compliance = self.compliance_router.route(ctx)
+        sentimentclusters = self.cluster_worker.cluster(assets)
+        manifest = archivalcompressionpipeline.build_manifest(assets, sentimentclusters)
+        compressed_payload, payloadbytesize = archivalcompressionpipeline.compress(assets, manifest)
+
+        self.rbac.authorize(executor_actor, "download_packet", self.whitelabelid)
+        packet_meta = self.packager.package(compressed_payload, ctx.userid)
+
+        self.rbac.authorize(executor_actor, "trigger_billing", self.whitelabelid)
+        billing_record = self.billing_core.execute_billing(ctx, assets)
+
+        self.rbac.authorize(executor_actor, "download_pdf", self.whitelabelid)
+        pdf_meta = self.pdf_builder.build(
+            ctx, assets, compliance, billing_record, packet_meta,
+            layer2_ledgerblockhash=layer2_ledgerblockhash,
+            layer3_workflows=layer3_workflows,
+        )
+
+        return {
+            "userid": ctx.userid,
+            "executorid": ctx.executorid,
+            "case_id": ctx.case_id,
+            "dpoahash": ctx.dpoahash,
+            "fiduciaryjurisdiction": ctx.fiduciaryjurisdiction,
+            "fiduciarybondstatus": ctx.fiduciarybondstatus,
+            "compliance": compliance,
+            "sentimentclusters": sentimentclusters,
+            "payloadbytesize": payloadbytesize,
+            "envelopekey": packet_meta["envelopekey"],
+            "packetoutputurl": packet_meta["packetoutputurl"],
+            "indexpdfhash": pdf_meta["indexpdfhash"],
+            "pdfpath": pdf_meta["pdfpath"],
+            "assetvaluation": billing_record["assetvaluation"],
+            "executionfeecalculated": billing_record["executionfeecalculated"],
+            "subscribestatus": self.billing_core.subscribestatus,
+            "whitelabelid": self.whitelabelid,
+            "circuitbreakerstatus": self.billing_core.circuitbreakerstatus,
+            "rbacauditlog": self.rbac.get_audit_log(),
+        }
+
+
+# ======================================================================
+# FULL PIPELINE ORCHESTRATOR — L1 → L2 → L3 → L4 → L5 → L6 → L7
+# ======================================================================
+
+class fullpipelineorchestrator:
+    """
+    Chronological merge entrypoint:
+      L1 enroll → L2 verify → L3 execute → L4 packet → L5 compliance →
+      L6 PDF → L7 billing/RBAC
+    """
+
+    def __init__(self, whitelabelid: str = "TENANT_DIRECT_001"):
+        self.whitelabelid = whitelabelid
+        self.l47 = cognitiveprobateorchestrator(whitelabelid=whitelabelid)
+
+    def run(
+        self,
+        db: Session,
+        ctx: fiduciarycontext,
+        force_skip_cooling_off: bool = False,
+        auto_complete_workflows: bool = True,
+    ) -> dict[str, Any]:
+        if not ctx.case_id:
+            raise ValueError("fiduciarycontext.case_id is required for L2/L3 pipeline")
+
+        verification = get_verification(db, ctx.case_id)
+        if not verification.ready_for_execution and not force_skip_cooling_off:
+            raise HTTPException(
+                status_code=409,
+                detail="Case not ready — complete L2 verification and cooling-off first",
+            )
+
+        layer3_workflows = start_case_execution(
+            db, ctx.case_id, force_skip_cooling_off=force_skip_cooling_off
+        )
+
+        if auto_complete_workflows:
+            layer3_workflows = run_all_workflows_to_completion(db, ctx.case_id)
+
+        verification_row = ensure_case(db, ctx.case_id)
+        digital_assets = layer1_graph_to_digitalassets(db, ctx.userid)
+
+        l47_result = self.l47.run(
+            ctx,
+            digital_assets,
+            layer2_ledgerblockhash=verification_row.ledgerblockhash,
+            layer3_workflows=layer3_workflows,
+        )
+
+        return {
+            "layer2_verification": verification.model_dump(),
+            "layer3_workflows": [w.model_dump() for w in layer3_workflows],
+            **l47_result,
+        }
+
+
+# ======================================================================
+# FASTAPI — HTTP SURFACE (L1–L3 ROUTES + HEALTH)
+# ======================================================================
+
+layer1_router = APIRouter(prefix="/layer1", tags=["Layer1-Enrollment"])
+
+
+@layer1_router.post("/assets", response_model=assetnodeout)
+def post_asset(req: assetenrollrequest, db: Session = Depends(get_db)) -> assetnodeout:
+    return enroll_asset(db, req)
+
+
+@layer1_router.get("/assets", response_model=list[assetnodeout])
+def get_assets(db: Session = Depends(get_db)) -> list[assetnodeout]:
+    return list_assets(db)
+
+
+@layer1_router.get("/assets/{assetid}", response_model=assetnodeout)
+def get_one_asset(assetid: str, db: Session = Depends(get_db)) -> assetnodeout:
+    return get_asset(db, assetid)
+
+
+@layer1_router.get("/graph/order", response_model=dependencyorderout)
+def get_graph_order(db: Session = Depends(get_db)) -> dependencyorderout:
+    return dependencyorderout(ordered_assetids=resolve_execution_order(db))
+
+
+layer2_router = APIRouter(prefix="/layer2", tags=["Layer2-Verification"])
+
+
+@layer2_router.post("/registry-hit", response_model=verificationout)
+def post_registry_hit(req: registryhitrequest, db: Session = Depends(get_db)) -> verificationout:
+    return record_registry_hit(db, req.case_id, req.deceased_name, req.death_certificate_id)
+
+
+@layer2_router.post("/attestation", response_model=verificationout)
+def post_attestation(req: attestationrequest, db: Session = Depends(get_db)) -> verificationout:
+    return record_attestation(db, req.case_id, req.contact_id)
+
+
+@layer2_router.post("/dead-man", response_model=verificationout)
+def post_dead_man(req: deadmanconfigrequest, db: Session = Depends(get_db)) -> verificationout:
+    configure_dead_man(db, req.case_id, req.armed, req.inactivity_days)
+    return get_verification(db, req.case_id)
+
+
+@layer2_router.get("/verification/{case_id}", response_model=verificationout)
+def get_case_verification(case_id: str, db: Session = Depends(get_db)) -> verificationout:
+    return get_verification(db, case_id)
+
+
+layer3_router = APIRouter(prefix="/layer3", tags=["Layer3-Execution"])
+
+
+@layer3_router.post("/execute", response_model=list[workflowout])
+def post_execute(req: startexecutionrequest, db: Session = Depends(get_db)) -> list[workflowout]:
+    return start_case_execution(db, req.case_id, force_skip_cooling_off=req.force_skip_cooling_off)
+
+
+@layer3_router.post("/checkpoint", response_model=workflowout)
+def post_checkpoint(req: approvecheckpointrequest, db: Session = Depends(get_db)) -> workflowout:
+    return approve_checkpoint(db, req.workflowid, req.approved)
+
+
+@layer3_router.post("/advance/{workflowid}", response_model=workflowout)
+def post_advance(workflowid: str, db: Session = Depends(get_db)) -> workflowout:
+    return advance_executing(db, workflowid)
+
+
+@layer3_router.get("/workflows", response_model=list[workflowout])
+def get_workflows(case_id: str | None = None, db: Session = Depends(get_db)) -> list[workflowout]:
+    return list_workflows(db, case_id)
+
+
+app = FastAPI(
+    title="Cognitive Probate — Unified Fiduciary Engine (L1–L7)",
+    version=__version__,
+    description="Merged backend: Layers 1–3 (enroll/verify/execute) + Layers 4–7 (packet/compliance/billing/RBAC).",
+)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    init_db()
+
+
+@app.get("/health")
+def health() -> dict:
+    return {
+        "status": "ok",
+        "layers": ["layer1", "layer2", "layer3", "layer4", "layer5", "layer6", "layer7"],
+        "version": __version__,
+    }
+
+
+app.include_router(layer1_router)
+app.include_router(layer2_router)
+app.include_router(layer3_router)
+
+
+# ======================================================================
+# DEMO / EXECUTION ENTRYPOINT — FULL L1→L7 SYNTHETIC ESTATE
+# ======================================================================
+
+def _seed_layer1_estate(db: Session, userid: str) -> None:
+    """Enroll a synthetic estate into Layer 1 tables."""
+    base_time = datetime(2026, 6, 1, 9, 0, 0)
+    enrollments = [
+        assetenrollrequest(
+            assetid="acc_netflix_001", providername="netflix",
+            assetcategory=assetcategory.subscription, dispositionintent=dispositionintent.cancel,
+            financial_value_monthly=15.99,
+        ),
+        assetenrollrequest(
+            assetid="acc_spotify_002", providername="spotify",
+            assetcategory=assetcategory.subscription, dispositionintent=dispositionintent.cancel,
+            financial_value_monthly=10.99,
+        ),
+        assetenrollrequest(
+            assetid="acc_gdrive_003", providername="google",
+            assetcategory=assetcategory.cloud_storage, dispositionintent=dispositionintent.archive,
+            financial_value_monthly=1.99,
+            metadata={
+                "sentimentaltag": True,
+                "createdat": (base_time + timedelta(hours=0)).isoformat(),
+                "gpslat": 12.9716, "gpslon": 77.5946,
+                "rawbytesize": 4_500_000, "simulate_content": True,
+            },
+            oauth_token="oauth_stub_google",
+        ),
+        assetenrollrequest(
+            assetid="acc_photos_004", providername="google",
+            assetcategory=assetcategory.media, dispositionintent=dispositionintent.transfer,
+            beneficiaryid="ben_priya_001", financial_value_monthly=0.0,
+            graphdependencies=["acc_gdrive_003"],
+            metadata={
+                "sentimentaltag": True,
+                "createdat": (base_time + timedelta(hours=6)).isoformat(),
+                "gpslat": 12.9720, "gpslon": 77.5950,
+                "rawbytesize": 12_800_000, "simulate_content": True,
+            },
+        ),
+        assetenrollrequest(
+            assetid="acc_letters_005", providername="protonmail",
+            assetcategory=assetcategory.correspondence, dispositionintent=dispositionintent.archive,
+            financial_value_monthly=0.0,
+            metadata={
+                "sentimentaltag": True,
+                "createdat": (base_time + timedelta(days=10)).isoformat(),
+                "gpslat": 19.0760, "gpslon": 72.8777,
+                "rawbytesize": 250_000, "simulate_content": True,
+            },
+        ),
+        assetenrollrequest(
+            assetid="acc_bank_006", providername="icici",
+            assetcategory=assetcategory.financial, dispositionintent=dispositionintent.transfer,
+            beneficiaryid="ben_priya_001", financial_value_monthly=0.0,
+            graphdependencies=["acc_gdrive_003"],
+        ),
+    ]
+    for req in enrollments:
+        try:
+            enroll_asset(db, req)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+
+
+def _build_fiduciary_context(userid: str, executorid: str, case_id: str) -> fiduciarycontext:
+    dpoahash = hashlib.sha256(b"signed-dpoa-document-v1::" + userid.encode()).hexdigest()
+    return fiduciarycontext(
+        userid=userid,
+        executorid=executorid,
+        dpoahash=dpoahash,
+        fiduciaryjurisdiction="US-CA",
+        fiduciarybondstatus="BONDED",
+        case_id=case_id,
+    )
+
+
+def _fast_forward_cooling_off(db: Session, case_id: str) -> None:
+    row = ensure_case(db, case_id)
+    if row.coolingoffend:
+        row.coolingoffend = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+
+
+if __name__ == "__main__":
+    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    init_db()
+
+    userid = "usr_shreyas_9f21"
+    executorid = "exe_priya_4a02"
+    case_id = "case_shreyas_2026"
+
+    db = sessionlocal()
+    try:
+        print("=" * 78)
+        print("COGNITIVE PROBATE - UNIFIED L1->L7 PIPELINE EXECUTION")
+        print("=" * 78)
+
+        print("\n[LAYER 1] Enrolling digital asset graph...")
+        _seed_layer1_estate(db, userid)
+        ordered = resolve_execution_order(db)
+        print(f"  enrolled assets: {len(list_assets(db))}")
+        print(f"  dependency order: {ordered}")
+
+        print("\n[LAYER 2] Verification & consensus...")
+        record_registry_hit(db, case_id, "Shreyas Example", "DC-2026-0042")
+        record_attestation(db, case_id, "contact_priya_001")
+        _fast_forward_cooling_off(db, case_id)
+        verification = get_verification(db, case_id)
+        print(f"  consensusscore={verification.consensusscore}, ready={verification.ready_for_execution}")
+        print(f"  ledgerblockhash={verification.ledgerblockhash}")
+
+        ctx = _build_fiduciary_context(userid, executorid, case_id)
+        pipeline = fullpipelineorchestrator(whitelabelid="TENANT_DIRECT_001")
+
+        print("\n[LAYER 3->7] Running full pipeline (execute -> packet -> compliance -> PDF -> billing)...")
+        result = pipeline.run(db, ctx, force_skip_cooling_off=True, auto_complete_workflows=True)
+
+        print(json.dumps(
+            {k: v for k, v in result.items() if k not in ("rbacauditlog", "layer3_workflows")},
+            indent=2,
+            default=str,
+        ))
+
+        print("\n" + "-" * 78)
+        print("LAYER 3 WORKFLOWS")
+        print("-" * 78)
+        for wf in result["layer3_workflows"]:
+            print(
+                f"  {wf['workflowid']} | {wf['assetid']} | rank={wf['financialdrainrank']} | "
+                f"{wf['tierclassification']} | {wf['executionstate']} | checkpoint={wf['Humancheckpointtriggered']}"
+            )
+
+        print("\n" + "-" * 78)
+        print("RBAC AUDIT LOG (Layer 7B)")
+        print("-" * 78)
+        for entry in result["rbacauditlog"]:
+            print(
+                f"[{entry['result']:>24}] {entry['role']:<16} -> {entry['action']:<18} "
+                f"(actor={entry['principalid']}, tenant={entry['actorwhitelabelid']})"
+            )
+
+        print("\n" + "-" * 78)
+        print("VERIFICATION: decrypt legacy packet (Layer 4.3)")
+        print("-" * 78)
+        decrypted = cryptographicenvelopepackager.verify_decrypt(
+            result["packetoutputurl"], result["envelopekey"]
+        )
+        decompressed = gzip.decompress(decrypted)
+        manifest_json_end = decompressed.find(b"\x00CONTENT\x00")
+        recovered_manifest = json.loads(decompressed[:manifest_json_end])
+        print(f"decrypted + decompressed successfully: {len(decompressed)} bytes recovered")
+        print(f"recovered manifest asset count: {recovered_manifest['assetcount']}")
+        print(f"recovered sentiment cluster count: {len(recovered_manifest['sentimentclusters'])}")
+
+        print("\n" + "-" * 78)
+        print("VERIFICATION: RBAC cross-tenant denial (Layer 7B)")
+        print("-" * 78)
+        rogue_actor = principal(
+            principalid="rogue_admin_999",
+            principalrole=role.tenant_admin,
+            whitelabelid="TENANT_OTHERFIRM_777",
+        )
+        try:
+            pipeline.l47.rbac.authorize(rogue_actor, "read_billing", pipeline.whitelabelid)
+        except accessdeniederror as e:
+            print(f"CORRECTLY DENIED: {e}")
+
+        print("\n" + "-" * 78)
+        print("VERIFICATION: circuit breaker on anomalous re-valuation (Layer 7A)")
+        print("-" * 78)
+        inflated = layer1_graph_to_digitalassets(db, userid) + [
+            digitalasset(
+                assetid="acc_anomaly_999", userid=userid, provider="SuspiciousCorp",
+                category="financial", disposition=assetdisposition.transfer,
+                monthlycost=100000.0,
+            )
+        ]
+        try:
+            pipeline.l47.billing_core.execute_billing(ctx, inflated)
+        except circuitbreakertripped as e:
+            print(f"CORRECTLY TRIPPED: {e}")
+            print(f"circuitbreakerstatus now = {pipeline.l47.billing_core.circuitbreakerstatus}")
+
+        print("\n" + "=" * 78)
+        print(f"Legacy packet written to : {result['packetoutputurl']}")
+        print(f"Court-ready PDF written to: {result['pdfpath']}")
+        print(f"indexpdfhash              : {result['indexpdfhash']}")
+        print(f"L2 audit chain head       : {verification.ledgerblockhash}")
+        print("=" * 78)
+    finally:
+        db.close()
+
  
